@@ -793,6 +793,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#vision-encoders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vision encoders
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#attention-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1719,6 +1730,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#vision-encoders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vision encoders
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#attention-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2246,6 +2268,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#vision-encoders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vision encoders
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#attention-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2681,7 +2714,7 @@ are bucketed independently: the packed <code>num_tokens</code> for the block gra
 hybrid Mamba+attention stacks that mix layer classes in one list. A <code>ModuleList</code> of bare
 <code>Attention</code> layers (Zamba2's shared <code>dpa_list</code>) is skipped: it is not a block stack. So is any list under a vision tower
 (<code>vision_encoder</code>, <code>vision_tower</code>, <code>vision_model</code>, <code>visual</code>), which stays eager unless
-marked (below). Models whose
+marked (below) or compiled per encoder budget (see <a href="#vision-encoders">Vision encoders</a>). Models whose
 attention is not a vLLM <code>Attention</code> — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.</p>
 <p>A vision tower opts in. A block cannot assemble a constant
@@ -2735,6 +2768,135 @@ eager form. <code>lm_head</code> is never in a block graph either — <code>comp
 on the wrapper — so its projection compiles its own graph, over row widths warmup pads onto (see <a href="../user_guide/configuration.html#decoder-compile-buckets">Decoder compile buckets</a>).</p>
 <p><code>SPYRE_COMPILE_GRANULARITY=model</code> restores the whole-model fullgraph, whose compile cost
 grows with layer count.</p>
+<h2 id="vision-encoders">Vision encoders<a class="headerlink" href="#vision-encoders" title="Permanent link">&para;</a></h2>
+<p>A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
+class with <code>SpyreVisionEncoderMixin</code> (<code>models/_vision_encoder.py</code>) ahead of it. The mixin implements
+upstream's <code>SupportsEncoderCudaGraph</code> protocol, so the bucketing is upstream's:
+<code>EncoderCudaGraphManager</code> picks power-of-two token budgets, packs a step's images into them,
+pads the inputs and splits the output per image. <code>SpyreEncoderGraphManager</code>
+(<code>v1/worker/spyre_encoder_graph.py</code>) replaces only capture and replay: capturing a budget
+compiles the encoder at that static shape during warmup, and replay uploads the padded
+inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
+kernels, so the compile guard covers the vision graphs. Upstream's
+<code>GPUModelRunner._execute_mm_encoder</code> already sends encoder work through the manager, and
+the embedding merge, encoder cache and decoder are unchanged.</p>
+<p><img alt="Vision encoder" src="multimodal-vision-encoder.svg" /></p>
+<p>Its source is <code>multimodal-vision-encoder.d2</code>; regenerate it from <code>docs/architecture/</code> with <code>d2 --layout elk --pad 40 multimodal-vision-encoder.d2 multimodal-vision-encoder.svg</code>.</p>
+<p>Adding a model means one file in <code>models/</code> (plus its <code>_ADAPTED_ARCHS</code> entry): the subclass
+implements the hooks below and nothing in the runner or manager changes. The units follow
+upstream: an <em>image token</em> is one position of <code>vision_project</code>'s output, counted by upstream's token
+budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one entry per <em>patch</em>,
+<code>patches_per_token</code> per image token.</p>
+<table>
+<thead>
+<tr>
+<th>Hook</th>
+<th>Required</th>
+<th>Purpose</th>
+<th>Native Pixtral (<code>models/pixtral.py</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vision_buffers</code>, <code>patches_per_token</code>, <code>out_hidden_size</code></td>
+<td>yes</td>
+<td>host inputs (fp16, or integer indices) and their padding values; patches per image token; output width</td>
+<td>patches, one-hot segments, positions; <code>M²</code>; text hidden size</td>
+</tr>
+<tr>
+<td><code>vision_item_tokens(mm_kwargs)</code></td>
+<td>yes</td>
+<td>image tokens per item, for packing into budgets</td>
+<td>patches / <code>M²</code> per image</td>
+</tr>
+<tr>
+<td><code>vision_inputs(mm_kwargs)</code></td>
+<td>yes</td>
+<td>host buffers, unpadded; validated against <code>vision_buffers</code></td>
+<td>offset-major patches, segments, RoPE positions</td>
+</tr>
+<tr>
+<td><code>vision_embed(values)</code></td>
+<td>yes</td>
+<td>graph 1: patches -&gt; block input embeddings and shared block inputs</td>
+<td>patch linear, <code>ln_pre</code>, image mask</td>
+</tr>
+<tr>
+<td><code>vision_blocks()</code></td>
+<td>yes</td>
+<td>graph 2: blocks sharing one artifact</td>
+<td><code>TransformerBlock</code>s with <code>SpyrePixtralAttention</code></td>
+</tr>
+<tr>
+<td><code>vision_project(x, taps)</code></td>
+<td>yes</td>
+<td>graph 3: merge or pool, then project into the text space</td>
+<td>projector norm, patch merge, adapter</td>
+</tr>
+<tr>
+<td><code>vision_call_block</code></td>
+<td>no</td>
+<td>block call convention (default <code>block(x, **kw)</code>)</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>vision_taps</code></td>
+<td>no</td>
+<td>intermediate hidden states passed to <code>vision_project</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>vision_pad_groups</code>, <code>vision_patch_multiple</code></td>
+<td>no</td>
+<td>padding layout and alignment (default: one group per merge offset, 64-wide sticks)</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>vision_max_items_per_call</code></td>
+<td>no</td>
+<td>layout bound on items per encoder call</td>
+<td>63 (one-hot width)</td>
+</tr>
+<tr>
+<td><code>vision_modalities</code></td>
+<td>no</td>
+<td>modalities run through the graphs; others go to upstream's <code>embed_multimodal</code></td>
+<td><code>("image",)</code></td>
+</tr>
+</tbody>
+</table>
+<p>Two upstream protocol methods are also the extension points for model-specific shapes, used
+as upstream models use them: override <code>postprocess_encoder_output</code> when placeholder embeddings
+differ from the encoder's image tokens (unpadding, newline tokens; its input is already on the
+host), and <code>get_encoder_cudagraph_budget_range</code> when the processor's largest item is not counted
+in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
+capture inputs, forward), so an upstream class's own versions of those are always shadowed. <code>select_encoder_cudagraph_items</code> and <code>get_input_modality</code> come from the
+upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
+upstream Pixtral does not, so <code>SpyrePixtralForConditionalGeneration</code> writes them. The eager
+(<code>enforce_eager</code>) path runs the same hooks uncompiled. Upstream's processor, weight mapper,
+placeholders and <code>embed_input_ids</code> are inherited unchanged.</p>
+<p>Constraints the layout follows:</p>
+<ul>
+<li>The largest budget is the largest item the model's upstream processor can produce
+  (<code>MultiModalBudget.mm_max_toks_per_item</code>, the same number the scheduler's encoder budget
+  uses, or the model's <code>get_encoder_cudagraph_budget_range</code>), so no item needs a shape
+  warmup skipped. Each budget's patch count is a whole multiple of <code>vision_patch_multiple</code>.</li>
+<li>Patches are <strong>offset-major</strong>: one group per offset inside a merge group, each padded at
+  its own tail. The patch merge is then a free view to <code>[M², tokens, D]</code>, a batched matmul
+  and a sum. Upstream's <code>unfold</code> regroup has no lowering, and a <code>[L, D] → [L/M², M²·D]</code>
+  reshape feeding a matmul cannot be laid out.</li>
+<li>The image mask is <code>segments @ segmentsᵀ</code> over a one-hot <code>[L, 64]</code> segment matrix (the last
+  column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
+  cannot lay out.</li>
+<li>RoPE positions are uploaded as integers and cos/sin are gathered on the card from a
+  <code>GatherTable</code> (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
+  one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a
+  64-wide head's 32-wide halves cannot be sliced.</li>
+<li>The encoder output comes back to the host in one copy and is sliced there: device views
+  at offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
+  runs on the host anyway.</li>
+<li>Tensor parallelism only; <code>mm_encoder_tp_mode="data"</code> is rejected.</li>
+</ul>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
 <p>Decoder attention has two backends, which differ only in how a page is laid out; the
 default is the head-major one described below. <code>SpyreAttentionBackend</code> is the token-major
